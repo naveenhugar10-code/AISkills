@@ -1,0 +1,7 @@
+---
+type: llm
+focus: trace
+weight: 1
+---
+
+The result matches this description: Runs the trend collector (or explains which sources were unavailable), ranks concepts with timeliness tied to 12 January, writes 3 scene specs using only verified/sourced Vivekananda quotes, renders 3 vertical 1080x1920 videos between 15 and 60 seconds, writes metadata.json for YouTube (private, #Shorts) and Instagram for each, and does not upload.
