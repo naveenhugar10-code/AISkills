@@ -72,6 +72,30 @@ def synthesize(text, voice, rate, mp3_path):
     return words
 
 
+def espeak_synthesize(text, lang, mp3_path, wpm=175):
+    """Offline robotic fallback (espeak-ng). Good for drafts/timing, not for publishing."""
+    exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not exe:
+        raise RuntimeError("espeak-ng not installed")
+    wav = mp3_path + ".wav"
+    run([exe, "-v", lang.split("-")[0], "-s", str(wpm), "-w", wav, text])
+    run(["ffmpeg", "-y", "-i", wav, "-af", "silenceremove=start_periods=1:start_threshold=-50dB", mp3_path])
+    dur = probe_duration(mp3_path)
+    return weighted_word_timings(text, dur), dur
+
+
+def weighted_word_timings(text, duration):
+    """Spread words over the duration in proportion to their length (better than even spacing)."""
+    toks = text.split()
+    weights = [len(t) + 2 for t in toks]
+    total, acc, out = sum(weights) or 1, 0.0, []
+    for t, w in zip(toks, weights):
+        st = duration * acc / total
+        acc += w
+        out.append({"start": st, "end": duration * acc / total, "word": t})
+    return out
+
+
 def even_word_timings(text, duration):
     toks = text.split()
     step = duration / max(1, len(toks))
@@ -299,7 +323,12 @@ def build_captions(words, overlays, font, ass_path, srt_path, chunk=3):
         """)
     lines, srt = [header], []
     # group words into chunks; one event per word with the active word highlighted
-    groups = [words[i:i + chunk] for i in range(0, len(words), chunk)]
+    groups = []
+    for w in words:  # chunk words, never letting a caption span two scenes
+        if groups and len(groups[-1]) < chunk and groups[-1][-1].get("scene") == w.get("scene"):
+            groups[-1].append(w)
+        else:
+            groups.append([w])
     for gi, g in enumerate(groups):
         g_end = groups[gi + 1][0]["start"] if gi + 1 < len(groups) else g[-1]["end"] + 0.4
         g_end = min(g_end, g[-1]["end"] + 0.6)
@@ -330,6 +359,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--font", help="caption font family (default: DejaVu Sans / Noto for Indic scripts)")
     ap.add_argument("--no-tts", action="store_true", help="silent preview with estimated timings")
+    ap.add_argument("--tts", choices=["edge", "espeak"], default="edge",
+                    help="edge = neural voice with espeak-ng then silence as fallbacks; espeak = offline draft voice")
     ap.add_argument("--keep-temp", action="store_true")
     a = ap.parse_args()
 
@@ -359,15 +390,24 @@ def main():
         mp3 = os.path.join(tmp, f"s{i:02d}.mp3")
         wav = os.path.join(tmp, f"s{i:02d}.wav")
         words = None
+        if a.tts == "espeak" and log["tts"] == "edge-tts":
+            log["tts"] = "espeak-fallback"
         if not a.no_tts and log["tts"] == "edge-tts":
             try:
                 words = synthesize(text, voice, rate, mp3)
                 speech = probe_duration(mp3)
             except Exception as e:  # noqa: BLE001
+                log["tts"] = "espeak-fallback"
+                log["warnings"].append(f"edge-tts failed ({type(e).__name__}: {str(e)[:150]}); "
+                                       "trying offline espeak-ng (draft quality)")
+        if words is None and not a.no_tts and log["tts"] == "espeak-fallback":
+            try:
+                words, speech = espeak_synthesize(text, lang, mp3)
+            except Exception as e:  # noqa: BLE001
                 log["tts"] = "silent-fallback"
-                log["warnings"].append(f"TTS failed ({type(e).__name__}: {str(e)[:150]}); rendering SILENT preview")
+                log["warnings"].append(f"espeak-ng failed ({e}); rendering SILENT preview")
         if words is None:
-            log["tts"] = "silent-fallback" if not a.no_tts else "disabled"
+            log["tts"] = "disabled" if a.no_tts else "silent-fallback"
             speech = max(1.5, len(text.split()) / 2.6)
             words = even_word_timings(text, speech)
             run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{speech:.3f}", mp3])
@@ -378,7 +418,7 @@ def main():
         run(["ffmpeg", "-y", "-i", mp3, "-af", f"apad=whole_dur={dur:.3f}", "-t", f"{dur:.3f}", "-ar", "44100",
              "-ac", "2", wav])
         for w in words:
-            all_words.append({"start": t + w["start"], "end": t + w["end"], "word": w["word"]})
+            all_words.append({"start": t + w["start"], "end": t + w["end"], "word": w["word"], "scene": i})
         if sc.get("on_screen"):
             overlays.append({"start": t + 0.1, "end": t + dur - 0.1, "style": "Top", "text": sc["on_screen"]})
         src, credit, kind, fit = resolve_visual(sc, i, assets, log)
@@ -426,7 +466,8 @@ def main():
     run(["ffmpeg", "-y", "-ss", "0.8", "-i", final, "-frames:v", "1", "-q:v", "2", os.path.join(out, "cover.jpg")])
 
     with open(os.path.join(out, "credits.txt"), "w", encoding="utf-8") as f:
-        f.write(f"Narration: AI voice ({voice}, Microsoft Edge TTS)\n" + "\n".join(credits) + "\n")
+        engine = {"edge-tts": f"{voice}, Microsoft Edge TTS", "espeak-fallback": "espeak-ng (draft)"}.get(log["tts"], "none")
+        f.write(f"Narration: AI voice ({engine})\n" + "\n".join(credits) + "\n")
     log["duration_s"] = round(probe_duration(final), 2)
     log["output"] = final
     with open(os.path.join(out, "render_log.json"), "w", encoding="utf-8") as f:
@@ -437,7 +478,9 @@ def main():
     print(f"rendered {final} ({log['duration_s']}s, tts={log['tts']})")
     for w in log["warnings"]:
         print("WARNING:", w)
-    if log["tts"] != "edge-tts":
+    if log["tts"] == "espeak-fallback":
+        print("NOTE: DRAFT voice (espeak-ng) - re-render where edge-tts is reachable before publishing.")
+    elif log["tts"] != "edge-tts":
         print("NOTE: this is a SILENT PREVIEW - do not publish it.")
 
 
